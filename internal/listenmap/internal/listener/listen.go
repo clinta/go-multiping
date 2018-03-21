@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -23,7 +22,8 @@ type Listener struct {
 	// try to lock for sending
 	// if returned f is not nil, call f to unlock
 	// if f is nil then i is zero and listener is not running
-	lockL chan chan<- func()
+	lockL       chan chan<- func()
+	angryPacket []byte
 }
 
 // New returns a new listener
@@ -40,6 +40,16 @@ func New(p int) *Listener {
 	case 6:
 		l.Props = messages.V6Props
 	}
+
+	l.angryPacket, _ = (&icmp.Message{
+		Code: 0,
+		Type: l.Props.RecvType,
+		Body: &icmp.Echo{
+			ID:  0,
+			Seq: 0,
+		},
+	}).Marshal(nil)
+
 	go func() {
 		var err error
 		var i int
@@ -93,25 +103,6 @@ func (l *Listener) Send(p *ping.Ping, dst net.Addr) error {
 	return err
 }
 
-// ToICMPMsg returns a byte array ready to send on the wire
-func (l *Listener) sendAngryPacket() {
-	b, err := (&icmp.Message{
-		Code: 0,
-		Type: l.Props.RecvType,
-		Body: &icmp.Echo{
-			ID:  0,
-			Seq: 0,
-		},
-	}).Marshal(nil)
-	if err != nil {
-		panic(err)
-	}
-	_, err = l.conn.WriteTo(b, l.Props.SrcAddr)
-	if err != nil {
-		panic(err)
-	}
-}
-
 func (l *Listener) send(p *ping.Ping, dst net.Addr) error {
 	p.Sent = time.Now()
 	b, err := p.ToICMPMsg()
@@ -149,56 +140,30 @@ func (l *Listener) run(getCb func(net.IP, uint16) func(context.Context, *ping.Pi
 		return cancelAndWait, err
 	}
 
-	// this is not inheriting a context. Each ip has a context, which will decrement the waitgroup when it's done.
+	// this is not inheriting a context, this thread will exit by cancelandwait
 	wCtx, wCancel := context.WithCancel(context.Background())
 
 	// start workers
-	proc, wWait := getProcFunc(wCtx, workers, buffer)
-
-	pWg := sync.WaitGroup{}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	rWg := make(chan struct{})
-	go func() {
-		for {
-			r := &messages.RecvMsg{
-				Payload: make([]byte, l.Props.ExpectedLen),
-			}
-			err := readPacket(l.conn, r)
-			if err != nil {
-				continue
-			}
-			select {
-			case <-ctx.Done():
-				close(rWg)
-				return
-			default:
-			}
-			pWg.Add(1)
-			r.Recieved = time.Now()
-			proc(ctx, r, getCb, pWg.Done)
-		}
-	}()
+	wWait := l.startWorkers(wCtx, workers, buffer, getCb)
 
 	cancelAndWait = func() {
-		cancel() // stop conection listener
+		wCancel() // stop workers
 		// Despite https://golang.org/pkg/net/#PacketConn claims
 		// close does not actually cause reads to be unblocked.
 		// This leads to nasty deadlocks.
 		// Throw angry packets at the connection until it dies!
+		wCh := make(chan struct{})
+		go func() { wWait(); close(wCh) }()
 	angryPackets:
 		for {
 			select {
-			case <-rWg: // The listern has returned
+			case <-wCh: // The listern has returned
 				break angryPackets
 			default:
-				l.sendAngryPacket()
+				_, _ = l.conn.WriteTo(l.angryPacket, l.Props.SrcAddr)
 			}
 		}
 		_ = l.conn.Close()
-		pWg.Wait() // wait for packets to be distributed
-		wCancel()  // stop workers
-		wWait()    // wait for workers to stop
 	}
 	return cancelAndWait, nil
 }

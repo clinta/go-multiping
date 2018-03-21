@@ -4,104 +4,147 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/TrilliumIT/go-multiping/internal/listenmap/internal/messages"
 	"github.com/TrilliumIT/go-multiping/ping"
 )
 
-type procFunc func(
+// returns a wait function
+func (l *Listener) startWorkers(
 	ctx context.Context,
-	r *messages.RecvMsg,
+	workers, buffer int,
 	getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
-	done func(),
-)
+) func() {
 
-func getProcFunc(ctx context.Context, workers, buffer int) (procFunc, func()) {
-	// start workers
+	wWg := sync.WaitGroup{}
+
 	if workers < -1 {
-		return func(
-			ctx context.Context,
-			r *messages.RecvMsg,
-			getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
-			done func(),
-		) {
-			processMessage(ctx, r, getCb)
-			done()
-		}, func() {}
+		wWg.Add(1)
+		go func() {
+			l.singleWorker(ctx, getCb)
+			wWg.Done()
+		}()
+		return wWg.Wait
+	}
+
+	if workers == -1 {
+		wr := make(chan struct{}, 16)
+		wWg.Add(1)
+		go func() {
+			l.dynamicWorker(ctx, getCb, wr, func() { wWg.Add(1) }, wWg.Done)
+			wWg.Done()
+		}()
+		return wWg.Wait
 	}
 
 	if workers == 0 {
-		return func(
-			ctx context.Context,
-			r *messages.RecvMsg,
-			getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
-			done func(),
-		) {
-			go func() {
-				processMessage(ctx, r, getCb)
-				done()
-			}()
-		}, func() {}
-	}
-
-	wCh := make(chan *procMsg, buffer)
-	wWg := sync.WaitGroup{}
-	if workers == -1 {
-		return func(
-			ctx context.Context,
-			r *messages.RecvMsg,
-			getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
-			done func(),
-		) {
-			select {
-			case wCh <- &procMsg{ctx, r, getCb, done}:
-				return
-			default:
-			}
-			wWg.Add(1)
-			go func() {
-				runWorker(ctx, wCh)
-				wWg.Done()
-			}()
-			wCh <- &procMsg{ctx, r, getCb, done}
-		}, wWg.Wait
+		wWg.Add(1)
+		go func() {
+			l.goRoutineWorker(ctx, getCb, func() { wWg.Add(1) }, wWg.Done)
+			wWg.Done()
+		}()
+		return wWg.Wait
 	}
 
 	for w := 0; w < workers; w++ {
 		wWg.Add(1)
 		go func() {
-			runWorker(ctx, wCh)
+			l.singleWorker(ctx, getCb)
 			wWg.Done()
 		}()
 	}
-
-	return func(
-		ctx context.Context,
-		r *messages.RecvMsg,
-		getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
-		done func(),
-	) {
-		wCh <- &procMsg{ctx, r, getCb, done}
-	}, wWg.Wait
+	return wWg.Wait
 }
 
-func runWorker(ctx context.Context, wCh <-chan *procMsg) {
+func ctxDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+	}
+	return false
+}
+
+func (l *Listener) readPacket() (*messages.RecvMsg, error) {
+	r := &messages.RecvMsg{
+		Payload: make([]byte, l.Props.ExpectedLen),
+	}
+	err := readPacket(l.conn, r)
+	r.Recieved = time.Now()
+	return r, err
+}
+
+func (l *Listener) singleWorker(
+	ctx context.Context,
+	getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
+) {
 	for {
-		select {
-		case <-ctx.Done():
+		r, err := l.readPacket()
+		if ctxDone(ctx) {
 			return
-		case p := <-wCh:
-			processMessage(p.ctx, p.r, p.getCb)
-			p.done()
+		}
+		if err != nil {
+			continue
+		}
+		processMessage(ctx, r, getCb)
+	}
+}
+
+func (l *Listener) goRoutineWorker(
+	ctx context.Context,
+	getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
+	wgAdd func(),
+	wgDone func(),
+) {
+	for {
+		r, err := l.readPacket()
+		wgAdd()
+		go func(r *messages.RecvMsg, err error) {
+			defer wgDone()
+			if ctxDone(ctx) {
+				return
+			}
+			if err != nil {
+				return
+			}
+			processMessage(ctx, r, getCb)
+		}(r, err)
+
+		if ctxDone(ctx) {
+			return
 		}
 	}
 }
 
-type procMsg struct {
-	ctx   context.Context
-	r     *messages.RecvMsg
-	getCb func(net.IP, uint16) func(context.Context, *ping.Ping)
-	done  func()
+func (l *Listener) dynamicWorker(
+	ctx context.Context,
+	getCb func(net.IP, uint16) func(context.Context, *ping.Ping),
+	wr chan struct{},
+	wgAdd func(),
+	wgDone func(),
+) {
+	for {
+		wr <- struct{}{}
+		r, err := l.readPacket()
+		if ctxDone(ctx) {
+			return
+		}
+		if err != nil {
+			continue
+		}
+		select {
+		case <-wr: // something else is ready for packets, leave it alone
+			wr <- struct{}{}
+		default:
+			wgAdd()
+			go func() {
+				l.dynamicWorker(ctx, getCb, wr, wgAdd, wgDone)
+				wgDone()
+			}()
+		}
+		processMessage(ctx, r, getCb)
+	}
 }
 
 func processMessage(
